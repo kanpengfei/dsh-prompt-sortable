@@ -1,0 +1,179 @@
+/**
+ * 宿主半打包（#39）：src/update/host/index.ts → lib/update.js
+ *
+ * 为什么要有这一步：客户端半走 tsdown（`lib/client.js`），宿主半却是检入的 JS；更新能力要在
+ * 宿主里 import 第三方包 `dsh-plugin-update`，还带一层 `../bridge.js` 的类型，所以给它一条
+ * 最小构建步骤（只用 esbuild，不引第二套打包器）。源码住 `src/update/host/`，`lib/` 只放产物；
+ * 产物与 `lib/index.js` / `lib/log/index.js` 一样入库（用户从 npm 装到的就是这个 lib/）。
+ *
+ * `dsh-plugin-update` **内联进产物**（#58 拍板，上一版是 externals，已推翻）：
+ *
+ * 更新包的 `dist/reader.js:102` 与 `dist/host.js:83` 用
+ * `containingPackage(fileURLToPath(import.meta.url), 'dsh-prompt')` 反推「正在运行的包」，
+ * 并从这里取 `runningVersion`（取不到就在 `dist/host.js:85` 抛 `unknown-profile`，三条路由全降级）。
+ * `import.meta.url` 属于**这段代码实际住的那个文件**：留 externals 时它住在
+ * `<profile>/node_modules/dsh-plugin-update/dist/{reader,host}.js`，而真机 profile 是 DSH 自己写死的
+ * **hoisted** 布局（app.asar：`nodeLinker: hoisted`，不一致还会改回来）⇒ 上溯到盘根都没有一个叫
+ * `dsh-prompt` 的 package.json ⇒ `loaded = null` ⇒ 部署到真机后三条更新路由只会回 `unknown-profile`
+ * （受控复现见 `scripts/test-issue-39.cjs` 的 13) 段与 `.wayfinder/update/58-progress.md`）。
+ * 内联后这段代码住在 `lib/update.js`，即**本插件包内** ⇒ 上溯第一个命中的就是本插件包的
+ * `package.json`（`name = "dsh-prompt"`）⇒ `loaded == installed`。
+ *
+ * 代价（明写在这里，别当成没发生）：更新包的版本被**冻结在构建期** —— 每次构建先由
+ * ensure:update-pkg 自动跟到上游 latest（#98，用户在地图 #96 两次明确拍板，覆盖 ADR-0003 的
+ * 人工钉版；离线构建只警告后用本地版继续，发版前 check:update-pkg 把门）。记录仍是精确值、
+ * 照旧重建重发（`lib/update.js` 本来就是入库的构建产物，升级路径与别处一致）；
+ * `package.json` 里它从 `dependencies` 降到 `devDependencies`，用户装到的包里不再另装它
+ * —— 这正是要的效果（本插件自包含，不依赖「插件包外恰好有一份更新包」）。
+ * 回归：`scripts/test-issue-39.cjs` 的 1) 段钉住产物里没有裸 import，13) 段钉住
+ * 「插件包外那层 node_modules 里有没有更新包都不影响」。
+ *
+ * ## 本脚本自己看门（#58 收口，复审 J 的爆点 1）
+ *
+ * 上一版这里不看门：`node_modules/dsh-plugin-update` 不在时，esbuild 把 `import('dsh-plugin-update')`
+ * 原样留在产物里（= 退回 externals 版），脚本照样 **exit 0** 并把它写进 `lib/update.js`
+ * —— 正是 #58 要消灭的那个会降级成 `unknown-profile` 的形状，而 `build.mjs` 的 verify 只
+ * `existsSync`，看不出区别。现在打包完立刻校验产物（见 `productProblem`）：内联标记在、
+ * 没有对更新包的裸导入、版本标记与 `devDependencies` 对得上；不满足就**拒收**（把构建前的产物放回去）
+ * 并 exit 1。测试那条闸门（`test:issue-39`）仍在，但不再是人唯一能撞上的门。
+ *
+ * ## #177：更新包事件目录快照
+ *
+ * 桥要区分「更新包目录内的正常日志事件」与「目录外漂移」，靠构建期冻结的事件目录快照
+ * `src/update/host/update-event-catalog.json`。快照由构建起点自动刷新 —— `ensure-latest.mjs`
+ * 在「同版直通 / 跟到新版」两条成功路径上都先跑 `gen-event-catalog.mjs`，所以自动跟最新（#98）
+ * 依然零人工步骤；本脚本打包前再验「快照 == 本次内联版本 == 实装包目录」「桥镜像事件名 ⊆ 目录」，
+ * 不满足就拒建（fail-closed，上游改名/删除必须人工确认）。快照与 `lib/` 一样检入，
+ * `check-lib-sync` 保证「提交的快照 == 重建结果」，`check:update-catalog` 是这条门禁的只读自查口。
+ */
+import { spawnSync } from 'node:child_process'
+import { build } from 'esbuild'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { catalogProblem, readGateInputs } from './event-catalog-gate.mjs'
+
+// 入口 / 产物 / 工作目录都钉在**本文件所在仓库**上：脚本从哪个 cwd 跑都行，且产物逐字节一致。
+// 上一版写的是 cwd 相对路径（'src/update/host/index.ts' / 'lib/update.js'），在仓根外裸跑直接 exit 1
+// （复审 V6② 实测：在 C:\ 下跑同一条命令挂掉）—— 构建脚本不该要求「先 cd 到仓根」。
+// absWorkingDir 也要给：esbuild 的源码注释路径是按工作目录算的，工作目录一变，产物里那几行
+// `// src/update/host/index.ts` 就会变成绝对路径 —— 那样同一份源码在两个 cwd 下会产出不同字节。
+const ROOT = fileURLToPath(new URL('../../', import.meta.url))
+const entry = fileURLToPath(new URL('../../src/update/host/index.ts', import.meta.url))
+const outfile = fileURLToPath(new URL('../../lib/update.js', import.meta.url))
+
+// #98 起构建先跟最新（用户在地图 #96 两次明确拍板，覆盖 ADR-0003 的人工钉版）：
+// ensure:update-pkg 把上游 latest 装进来后，下面的钉版重读（npm 已经把 package.json 写成新精确值）。
+// 离线时 ensure 只警告后继续，发版安全由 check:update-pkg 把门（见 #101）。
+const ensure = spawnSync(process.execPath, [fileURLToPath(new URL('./ensure-latest.mjs', import.meta.url))], {
+  stdio: 'inherit',
+})
+if (ensure.error || ensure.status !== 0) {
+  console.error('build-host: 跟最新步骤没过（见上），不用旧版硬建。')
+  process.exit(ensure.status || 1)
+}
+
+// 更新包的版本钉在 package.json 的 devDependencies 里（精确值，不是 caret）。
+// #98 后这个数字由 ensure 步骤自动写成 latest 再读到这里 —— 记录仍精确（可复现记录），
+// 只是不用人手改了。它同时进 banner：产物自己带上「我内联的是哪一版」，好让「升了包版本却忘了重建」
+// 从**入库字节**就能查出来（复审 J 的 Top2）。
+const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'))
+const inlinedVersion = pkg.devDependencies?.['dsh-plugin-update']
+if (typeof inlinedVersion !== 'string' || inlinedVersion === '') {
+  console.error('build-host: package.json 的 devDependencies 里没有 dsh-plugin-update（#58 起它是构建期输入）')
+  console.error('修法：先 npm i -D dsh-plugin-update@<版本>，再把**精确版本**（不要 ^ / ~）写进 devDependencies。')
+  process.exit(1)
+}
+/** node_modules 里实际装着的那一版（缺席是 null，由门禁统一报）。 */
+const installedVersion = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('../../node_modules/dsh-plugin-update/package.json', import.meta.url), 'utf8')).version
+  } catch {
+    return null
+  }
+})()
+
+/**
+ * #58 门禁：产物真的把更新包内联进来没有。返回 `null` = 通过，返回字符串 = 人话成因（调用方据此 exit 1）。
+ * 顺序有意：先判「内联没生效」（包缺席时就是这个形状），再判版本标记 —— 两种都要有各自的报错文本。
+ */
+function productProblem(bundle) {
+  if (!bundle.includes('containingPackage')) {
+    return '产物里找不到内联进来的更新包标记 containingPackage（更新包没被打进去）'
+  }
+  if (/from\s*["']dsh-plugin-update["']/.test(bundle) || /import\(\s*["']dsh-plugin-update["']\s*\)/.test(bundle)) {
+    return '产物里出现了对 dsh-plugin-update 的裸导入（内联没生效，等于退回 externals）'
+  }
+  const mark = bundle.match(/INLINED_UPDATE_PKG_VERSION\s*=\s*['"]([^'"]+)['"]/)
+  if (!mark) {
+    return '产物里没有内联包版本标记 INLINED_UPDATE_PKG_VERSION（banner 没注入？）'
+  }
+  if (mark[1] !== inlinedVersion) {
+    return '产物里的内联包版本标记是 ' + mark[1] + '，devDependencies 钉的是 ' + inlinedVersion
+  }
+  if (installedVersion !== inlinedVersion) {
+    return 'node_modules 里装的 dsh-plugin-update 是 ' + JSON.stringify(installedVersion)
+      + '，devDependencies 钉的是 ' + JSON.stringify(inlinedVersion) + '（两份不一致，产物会标错版本）'
+  }
+  return null
+}
+
+// #177 门禁（构建期硬门，fail-closed）：更新包事件目录快照 + 桥镜像事件名必须在打包前对齐。
+// 快照由构建起点刷新（上面的 ensure 步骤会调 gen-event-catalog.mjs）：同版直通与跟到新版都会先
+// 重新生成，所以这里读到的是「本次内联版本」的目录。门禁只负责拦下真异常 —— 快照/镜像名对不上
+// （人工改坏、上游事件改名/删除，或 ensure 被绕过直接跑本脚本），绝不静默通过。
+const gateInputs = readGateInputs(ROOT)
+const catalogGateProblem = catalogProblem({ ...gateInputs, inlinedVersion })
+if (catalogGateProblem !== null) {
+  console.error('build-host: #177 更新包事件目录门禁拒建 —— 不是打包失败，是构建期输入没对齐。')
+  console.error('  成因：' + catalogGateProblem)
+  console.error('  为什么这道门是硬的：桥按目录快照区分「正常事件（静默）」与「目录外漂移（每进程一次 info 自报）」，')
+  console.error('  快照与包目录 / 桥镜像名对不上时，运行期要么误报正常事件（#177），要么把真实的上游改名吞掉。')
+  console.error('  修法：npm run gen:update-catalog 重新生成快照（构建起点会自动跑；这里拒建说明输入没对齐或上游改名），')
+  console.error('  若是上游事件改名/删除，先对照 node_modules/dsh-plugin-update/event-list.update.json 人工确认再改桥。')
+  process.exit(1)
+}
+
+// 构建前的产物留一份：门禁不通过时放回去，免得盘上躺着一份降级产物等人误提交。
+const before = existsSync(outfile) ? readFileSync(outfile) : null
+
+const result = await build({
+  absWorkingDir: ROOT,
+  entryPoints: [entry],
+  outfile,
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  target: 'node22',
+  sourcemap: false,
+  logLevel: 'info',
+  legalComments: 'none',
+  banner: {
+    js:
+      '// AUTO-GENERATED by node scripts/update/build-host.mjs — DO NOT EDIT. Source: src/update/host/index.ts\n' +
+      '// 本产物内联的 dsh-plugin-update 版本标记（#58）：test:issue-39 会断言这一行 ==\n' +
+      '// package.json 的 devDependencies["dsh-plugin-update"] —— 升了包版本却忘了重建，这里就对不上。\n' +
+      "const INLINED_UPDATE_PKG_VERSION = '" + inlinedVersion + "';\n",
+  },
+})
+
+if (result.errors.length > 0) {
+  console.error('build-host: 打包失败')
+  process.exit(1)
+}
+
+// #58 门禁（复审 J 的爆点 1）：打包完立刻校验产物；不通过就拒收、exit 1，绝不留下降级产物。
+const bundle = readFileSync(outfile, 'utf8')
+const problem = productProblem(bundle)
+if (problem !== null) {
+  if (before === null) rmSync(outfile, { force: true })
+  else writeFileSync(outfile, before)
+  console.error('build-host: 产物没通过 #58 门禁 —— 拒收，lib/update.js 保持构建前的样子。')
+  console.error('  成因：' + problem)
+  console.error('  为什么这道门是硬的：更新包留 externals 时它的代码住在**插件包外**，而真机 profile 是 DSH 写死的')
+  console.error('  hoisted 布局 —— 它的 containingPackage 上溯命不中本插件包，三条更新路由只会回 unknown-profile')
+  console.error('  （#55 / #58 的受控实测，见 .wayfinder/update/58-progress.md）。')
+  console.error('  修法：把构建期输入装回来并对齐版本（npm ci，或 npm i -D dsh-plugin-update@' + inlinedVersion + '），再跑本脚本。')
+  process.exit(1)
+}
+console.log('build-host: 门禁通过 —— 内联 dsh-plugin-update@' + inlinedVersion
+  + '，产物 ' + Buffer.byteLength(bundle) + ' B。')

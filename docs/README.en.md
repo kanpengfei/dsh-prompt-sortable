@@ -1,0 +1,198 @@
+<h1 align="center">dsh-prompt</h1>
+
+<div align="center">
+
+[中文](../README.md) · **English**
+
+**Turn every repeated prompt into a template.**
+24 deep templates — one click drops the body into the chat box.<br>
+Works out of the box, fully customizable.
+
+Your ⭐ means the world to me.
+
+[![Version](https://img.shields.io/npm/v/dsh-prompt?color=2563EB)](https://www.npmjs.com/package/dsh-prompt) [![Downloads](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.npmjs.org%2Fdownloads%2Fpoint%2Flast-month%2Fdsh-prompt&query=%24.downloads&label=downloads&suffix=%2Fmonth&color=059669)](https://www.npmjs.com/package/dsh-prompt) [![Last commit](https://img.shields.io/github/last-commit/FeatherHunter/dsh-prompt?color=7C3AED)](https://github.com/FeatherHunter/dsh-prompt/commits/main) [![Commits](https://img.shields.io/github/commit-activity/m/FeatherHunter/dsh-prompt?color=DB2777)](https://github.com/FeatherHunter/dsh-prompt/graphs/commit-activity) [![Contributions welcome](https://img.shields.io/badge/contributions-welcome-EA580C.svg)](https://github.com/FeatherHunter/dsh-prompt/issues)
+
+</div>
+
+<div align="center">
+
+## Install <sub>INSTALL</sub>
+
+</div>
+
+<div align="center">
+
+Requires [DSH](https://www.npmjs.com/package/@deepseek-ai/dsh) (DeepSeek Harness).
+
+</div>
+
+```bash
+# 1. Install the DSH CLI (skip if present)
+npm install -g @deepseek-ai/dsh
+
+# 2. Install dsh-prompt — --profile is REQUIRED: install into the profile
+#    behind the DSH entry you actually use (wrong profile = silent no-op)
+dsh plugin --profile web add dsh-prompt       # self-hosted web service (dsh web)
+#     or
+dsh plugin --profile desktop add dsh-prompt   # DSH Desktop app
+# Pin a version for stability (current 0.4.40):
+dsh plugin --profile web add dsh-prompt@0.4.40 --registry https://registry.npmjs.org
+#     or
+dsh plugin --profile desktop add dsh-prompt@0.4.40 --registry https://registry.npmjs.org
+```
+
+<div align="center">
+
+Restart DSH once after installing.
+
+**👇 Restart after installing; a new button left of the input box means success.**
+
+<img src="../assets/readme/01-install-ready.png" width="720" alt="Prompt button left of the input box after install" style="border:1px solid #30363d;border-radius:6px">
+
+</div>
+
+<div align="center">
+
+## Way 1<br>Prompt button
+
+</div>
+
+<div align="center">
+
+Move the mouse onto the "Prompt" button left of the input box and the list opens by itself — both the official preset templates and our custom templates are right there.
+
+**👇 One click on the button and the panel looks like this.**
+
+<img src="../assets/readme/02-panel-button.png" width="640" alt="Prompt button hover panel with scope and label filters, template list, and a one-click hide-presets button" style="border:1px solid #30363d;border-radius:6px">
+
+Hit "Hide presets" in the bottom bar to hide the official preset prompts; hit "Show presets" to unhide them.
+
+Do not want it to open merely because the pointer passed over the button? Hit "Click to open" in the bottom bar (or "Trigger mode" in the settings panel): from then on the list opens and closes only on click and an accidental pointer pass no longer flickers; hit "Hover to open" to switch back.
+
+</div>
+
+<div align="center">
+
+## Way 2<br>/prompt trigger
+
+</div>
+
+<div align="center">
+
+Type `/prompt` or `/p` in the box.<br>
+`/prompt retro` narrows it down.
+
+**👇 `/prompt` shows every template.**
+
+<img src="../assets/readme/03-trigger-prompt.png" width="640" alt="`/prompt` trigger: candidates showing template name, labels and the opening of the body" style="border:1px solid #30363d;border-radius:6px">
+
+</div>
+
+<div align="center">
+
+## Settings<br>SETTINGS
+
+</div>
+
+<div align="center">
+
+**👇 The settings panel packs the whole feature set.**
+
+<img src="../assets/readme/05-templates-gallery.png" width="640" alt="Gallery: 24 preset templates on the settings page" style="border:1px solid #30363d;border-radius:6px">
+
+</div>
+
+<div align="center">
+
+## Customize & manage<br>CUSTOM
+
+</div>
+
+<div align="center">
+
+**👇 Add a custom prompt template: name, labels, text color and body — all DIY.**
+
+<img src="../assets/readme/06-custom-manage.png" width="560" alt="Custom management: new custom template dialog (name, labels, text color, body)" style="border:1px solid #30363d;border-radius:6px">
+
+The body is kept exactly as you write it: line breaks survive, including blank lines at the start or end (only leading/trailing spaces and tabs are trimmed). To put the caret where you want it after inserting, place `{{cursor}}` in the body — only the first one counts, the rest are removed. Without a marker the caret lands right after the inserted text; `/prompt` insertion only strips the marker and does not move the caret. After inserting, the first undo may undo just the caret step (you'll see the marker text come back); a second undo removes the insertion. Also, a literal `{{cursor}}` cannot be expressed for now — if you write it in a body, it is treated as a caret marker.
+
+**👇 The text color can be changed, and text outline is supported.**
+
+<img src="../assets/readme/07-custom-manage-color.png" width="560" alt="Text color popover: 60 swatches, follow-theme default, text outline toggle" style="border:1px solid #30363d;border-radius:6px">
+
+**👇 Custom prompts: text color is configurable.**
+
+<img src="../assets/readme/02-panel-button-only-custom.png" width="640" alt="Prompt button hover panel with preset templates hidden: custom templates only" style="border:1px solid #30363d;border-radius:6px">
+
+</div>
+
+<!-- MORE-START -->
+<div align="center">
+
+## More from the author <sub>MORE</sub>
+
+</div>
+
+<div align="left">
+
+If you like this plugin, these might help too:
+
+**[dsh-mattpocock-skills-deck](https://github.com/FeatherHunter/dsh-mattpocock-skills-deck)** — The whole mattpocock/skills set (nearly 300k stars) preinstalled — 27 skills, ready as soon as it is installed.
+
+**[dsh-opencode-palette](https://github.com/FeatherHunter/dsh-opencode-palette)** — 38 classic opencode themes + 20+ custom themes — reskin DSH in one click.
+
+**[dsh-im-companion](https://github.com/FeatherHunter/dsh-im-companion)** — Adds the ideas of an “assistant” and a “home” to dsh-im.
+
+**[ilife](https://github.com/FeatherHunter/ilife)** — ⚠️Work in progress⚠️ iLife, the home-life suite: bookkeeping, exercise, diet, weight, recipes, item management, schedule planning, memos and more.
+
+</div>
+<!-- MORE-END -->
+
+<div align="center">
+
+## Thanks <sub>THANKS</sub>
+
+</div>
+
+<div align="left">
+
+Questions, ideas, IDEs, inspiration, or just a chat: [open an ISSUE](https://github.com/FeatherHunter/dsh-prompt/issues)🌹
+
+Thanks to everyone who filed issues, sent PRs, or starred the repo — you make this toolbox better, bit by bit. Thank you so much! 🎉🎉🎉🎉🎉🎉🎉🎉🎉
+
+<!-- THANKS-TABLE-EN-START -->
+| Contributor | Tribute | Contributions |
+| --- | --- | --- |
+| [@wqzhellohhwy](https://github.com/wqzhellohhwy) | 🌹🌹🌹 | [#146](https://github.com/FeatherHunter/dsh-prompt/issues/146) [#147](https://github.com/FeatherHunter/dsh-prompt/issues/147) [#148](https://github.com/FeatherHunter/dsh-prompt/issues/148) |
+| [@zuojinxin](https://github.com/zuojinxin) | 🌹🌹 | [#195](https://github.com/FeatherHunter/dsh-prompt/issues/195) [#196](https://github.com/FeatherHunter/dsh-prompt/issues/196) |
+| [@SunWe-success](https://github.com/SunWe-success) | 🌹 | [#194](https://github.com/FeatherHunter/dsh-prompt/issues/194) |
+| [@minevery512](https://github.com/minevery512) | 🌹 | [#179](https://github.com/FeatherHunter/dsh-prompt/issues/179) |
+| [@kBlankii](https://github.com/kBlankii) | 🌹 | [#178](https://github.com/FeatherHunter/dsh-prompt/issues/178) |
+| [@dagangwo](https://github.com/dagangwo) | 🌹 | [#175](https://github.com/FeatherHunter/dsh-prompt/issues/175) |
+| [@jheroy](https://github.com/jheroy) | 🌹 | [#165](https://github.com/FeatherHunter/dsh-prompt/issues/165) |
+<!-- THANKS-TABLE-EN-END -->
+
+</div>
+
+---
+
+<!-- CONTACT-START -->
+## Feedback and Contact <sub>CONNECT</sub>
+
+<div align="center">
+
+👏Welcome PRs and issues. A single spark can start a prairie fire 🔥. Any suggestion, opinion, idea or rant — come join the group and talk.
+
+<table align="center"><tr><td align="center"><b>Feishu Group (Main)</b></td><td align="center"><b>QQ Group (New)</b></td><td align="center"><b>WeChat Group (New)</b></td></tr><tr><td><img src="https://cdn.jsdelivr.net/npm/dsh-featherhunter-plugin-base@0.1.5/data/img/card-feishu.png" width="260" alt="DSH plugin community group Feishu QR code" /></td><td><img src="https://cdn.jsdelivr.net/npm/dsh-featherhunter-plugin-base@0.1.5/data/img/card-qq.png" width="260" alt="DSH plugin community group QQ QR code" /></td><td><img src="https://cdn.jsdelivr.net/npm/dsh-featherhunter-plugin-base@0.1.5/data/img/card-wechat-2026-10-31.png?v=20261031" width="260" alt="DSH plugin community group WeChat QR code" /></td></tr></table>
+
+</div>
+<!-- CONTACT-END -->
+
+<!-- STAR-HISTORY-START -->
+<div align="center">
+
+![Star history chart (dual axis): total stars on the left, daily new stars on the right](https://raw.githubusercontent.com/FeatherHunter/dsh-prompt/main/docs/star-history.svg?v=202611010000)
+
+</div>
+<!-- STAR-HISTORY-END -->
+

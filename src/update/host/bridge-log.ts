@@ -1,0 +1,273 @@
+/**
+ * 更新包事件转日志桥（#171 N6：可 import 者 —— index）。
+ * 跑 node host 线（无 DOM）；禁被 src/client 进口（DO-NOT-IMPORT），禁 DOM/宿主调用。
+ */
+/**
+ * dsh-prompt — 更新能力宿主半的**日志桥**（#39）：把更新包报的三条事件转给本仓日志能力。
+ *
+ * **签名按上游 `dist/` 的真实调用点抄，不按 README 的示例文字抄**：`dist/host.js:187,196` 发的是
+ * `phoneLogCtx.fire(level, event, fields)`，`dist/store.js:273` 发的是 `log(level, event, fields)`
+ * —— 都是三参，事件名在第二个位置。#39 第一版写成两参 `fire(event, fields)`，于是 `"info"` 被当成
+ * 事件名、真事件名降级成字段对象、字段对象整条丢掉，再被事件闸门按「未声明事件」静默丢弃 ——
+ * 更新能力的诊断轨迹全丢而测试全绿（审查爆点 1）。
+ *
+ * 级别（第一参）不转交：本仓的级别由清单 `event-list.dsh-prompt.json` 按事件名决定，
+ * 不引入第二套级别语义。**字段名也不做第二道白名单**：白名单的权威是日志能力的闸门
+ * （`lib/log/gate.js`），这里按名字逐个挑字段等于在闸门前面又立一道白名单 —— 上游字段一改名就在
+ * 桥里被无声裁掉，而闸门的 `droppedFields` 恒 0，字段漂移变成零可观测（#39 复审 V3）。桥只判
+ * **事件名**：包里那三条走原样转交（字段名一个不动）；包里其余**目录内**事件（`update.status.changed`
+ * 等正常轨迹；目录 = 构建期内联版本的 `update-event-catalog.json` 快照）静默不转 —— 它们是正常事件，
+ * 不是漂移（#177 的核心修复）。只有目录**外**的事件（包升版新加、清单没声明）才每进程一次落
+ * `update.bridge.unknown-event`（info/resident，只带事件名指纹）；#177 之前这里把所有未镜像事件
+ * 都报成 `update.route.fail`（reason = unknown-event，warn），正常轮询被误报成路由失败。
+ *
+ * #39 在这条链上的三层防护（**都在值这一侧，字段名一个不动**）：
+ * - **语义白名单**（H1，一票否决项）：见 `safe-values.ts` 的 `SAFE_FIELD_ENUM` / `safeFields`。
+ * - **失败落盘节流**（H2/K3，本文件）：见 `noteFail` / `clearFails` / `DEFAULT_RELOG_FLOOR_MS`。
+ * - 事件名漂移自报：`update.bridge.unknown-event` 每进程只落一次，且只对**目录外**事件
+ *   （事件名漂移是**状态**，不是每次调用都会变的事实；#177）。
+ */
+
+/**
+ * 更新包日志口形状（#128：0.3.1 自带 d.ts 不再导出 UpdateLogCtx，手写垫片已随 #127 删除；
+ * 形状逐字对包 dist/host.js 的 phoneLogCtx.fire(level, event, fields) 三参调用，
+ * 结构上满足包 createHostUpdate 的 logCtx 入参，不按名引用）。
+ */
+export interface UpdateLogCtx {
+  fire(level: string, event: string, fields?: Record<string, unknown>): void
+}
+import { hash8 } from './error-fingerprint.js'
+import { safeFields } from './safe-values.js'
+import updateEventCatalog from './update-event-catalog.json'
+
+/**
+ * 本次构建内联的更新包**事件目录快照**（#177）：构建期由 `npm run gen:update-catalog` 从
+ * `node_modules/dsh-plugin-update/event-list.update.json` 派生、随产物冻结；构建期门禁
+ * （`scripts/update/event-catalog-gate.mjs`）校验它与包目录 / 镜像事件名的一致性。
+ * 目录内事件 = 正常轨迹（桥不镜像也**不自报**）；目录外事件才走每进程一次的自报出口。
+ */
+const KNOWN_UPDATE_EVENTS: ReadonlySet<string> = new Set(updateEventCatalog.events)
+
+/** 日志能力的形状（本能力只用到 `log`；`lib/index.js` 传进来的那个实例满足它）。 */
+export interface LogCapability {
+  log(event: string, fields?: Record<string, unknown>): unknown
+}
+
+/** 落盘节流的时间源与间隔（`createUpdateCapability` 的注入口，生产用真时钟 + 默认间隔）。 */
+export interface BridgeLogClock {
+  now?: () => number
+  relogFloorMs?: number
+}
+
+/**
+ * 失败落盘节流（#39 四轮整改 K3）：同一 `(method, kind)` 的持续失败不能每请求刷一行 ——
+ * `warn` 绕过日志开关（`dsh-log` 的 `isEnabled` 对 warn 恒真），真机上「电话持续失败」（断网 /
+ * `check-expired` / registry 抽风）配上旧面板轮询（#127 已删）就是每秒多行恒写、用户关不掉
+ * （复审 D 实测 62 次请求 124 行 / 20402 B ⇒ 54.2 MiB/天）。
+ *
+ * 三轮的处置是「按状态落一次」，复审 F 又量出两个残余，四轮一并修：
+ * - 同一状态**成因变化**（错误原文换了）→ 0 行，**第二种成因被静默吞掉**（本票最忌讳的一类病）；
+ *   现在：新的成因指纹记进 `pending`，离开重落间隔的**下一次任何调用**把它补落（见 noteFail）。
+ * - **成败交替**（每次成功清账、下一次失败又是新状态）→ 1 行/请求 ⇒ 13.38 MiB/天；现在受
+ *   `DEFAULT_RELOG_FLOOR_MS` 约束：同一状态两次落盘之间至少要隔这么久。
+ * 键**不含** errorHash（原文可能每次都不同 —— 超时里带毫秒、消息里带临时路径，放进去等于没去重），
+ * 也不设「最多记几个成因」的上限（上限会把真实的新失败丢掉；间隔本身已经把频率压住了）。
+ */
+export const DEFAULT_RELOG_FLOOR_MS = 60000
+
+/** 去重键：电话名 + 阶段（两个都是桥自己判过的语义取值，见 safe-values.ts）。 */
+function failKeyOf(method: string, kind: string): string {
+  return method + '\u0000' + kind
+}
+
+/**
+ * 一个失败状态的账：已落盘的成因、等间隔的成因队列、上次落盘时刻。
+ *
+ * 队列项除了成因指纹，还带着**这一条该落盘的 `errorHash` 值**：补落落的是队首那一条，
+ * 落盘行必须是**它自己**的值，不能拿当前请求的值顶替（#40 前置条件 2 / #39 复审 H 的 R2
+ * 实测过这种错配：账记的是 B、盘上写的是 A）。
+ */
+interface FailState {
+  reported: Set<string>
+  pending: Array<{ hash: string; at: number; errorHash: unknown }>
+  lastLogAt: number
+}
+
+/**
+ * `noteFail` 的判决。`null` = 本次不落盘；非空 = 落盘行的 `errorHash` 用这里的值
+ * （常态是本次请求的值，补落队首时是队首那条的值）。用对象包一层而不是直接返回那个值：
+ * 上游没带 `errorHash` 时「落盘但值为空」与「不落盘」必须能区分开 —— 前者是真失败，不许被静默。
+ */
+interface FailVerdict {
+  errorHash: unknown
+}
+
+/**
+ * 建日志桥。能力是异步建起来的，这里用一个可变槽兜住；闭包在能力就绪前被调用时直接丢掉那一批
+ * （只可能丢启动瞬间的一两条，日志能力缺席时的语义本来就是「不落盘」）。
+ */
+export function createBridgeLog(
+  logReady: Promise<LogCapability | null> | null | undefined,
+  clock?: BridgeLogClock,
+): UpdateLogCtx {
+  let cap: LogCapability | null = null
+  const now = typeof clock?.now === 'function' ? clock.now : () => Date.now()
+  const relogFloorMs = typeof clock?.relogFloorMs === 'number' && clock.relogFloorMs >= 0
+    ? clock.relogFloorMs
+    : DEFAULT_RELOG_FLOOR_MS
+  /** 目录外事件自报（update.bridge.unknown-event）每进程只落一次：事件名漂移是**状态**，不是每次调用都会变的事实（同复审 V1 的处置）。 */
+  let unknownReported = false
+  /** 已落过盘的电话失败状态（键见 failKeyOf）：持续失败不再每请求刷一行。 */
+  const failedStates = new Map<string, FailState>()
+  if (logReady && typeof logReady.then === 'function') {
+    logReady.then(
+      (ready) => { cap = ready && typeof ready.log === 'function' ? ready : null },
+      () => { cap = null },
+    )
+  }
+  /**
+   * 这个失败该不该落盘（H2 + 四轮整改 K3）。**速率由「失败到达的时刻」把关**（唯一定时器 = `lastLogAt`）：
+   * ① 没见过这个 (method, kind) → 落（**首条必落**：真实故障不许因为节流而看不见）；
+   * ② 这个成因**正排在队首等**且间隔已到 → 出队落它（见下）；
+   * ③ 这个成因已经落过 → 本次不落（但见下面 R2 那条：队首仍要得到补落机会）；
+   * ④ 这个成因已经在队列里等着 → 不落，**也不刷新它的等待起点**（重复报到不该让待落盘的东西一推再推）；
+   * ⑤ 全新成因且距上次到达 ≥ `relogFloorMs` → 落它并记进 `reported`；否则进队列等下一次调用。
+   * 「按到达时刻计时」而不是「按队列头年龄」是刻意的：成败交替时每次成功都会清账、
+   * 下一个失败又是「新状态」，只有按到达时刻才挡得住它（复审 F 实测 13.38 MiB/天）。
+   * 键稳定在 (method, kind)：**成因与次数进的是落盘判据，不是去重键**；队列不设条数上限
+   * （上限同样会丢掉真实的新失败；频率已经由间隔把关：每个间隔最多落一条）。
+   *
+   * **② 的来历（别删）**：早先的写法把「已在队列」放在最前面 return，于是「恢复（成功一次）→
+   * 同一个成因再失败」这条路上，该成因永远卡在队列里 —— 恢复把 `reported` 清空了、但（按设计）
+   * 不碰队列，它每次报到都被「已在队列」挡回，量出来的现象是「恢复 + 间隔到点后再失败 → 0 行」：
+   * 一个真实的持续故障被静默（复审 F 的 Top3）。队列里的成因本来就是「还没落盘、在等间隔」的东西，
+   * 该被认成**待补落**而不是**重复**，所以队首那条在 ② 出队。
+   *
+   * **② 与 ③④ 的顺序是本票的前置条件 2（#39 复审 H 的 R2）**：早先 ③ 直接 `return false`，而补落
+   * 只在 ⑤ 与 ④ 的尾巴上执行 —— 于是「A 落过一次 → 间隔内来了 B → 之后**只有 A 反复失败**」这条
+   * 日常序列里，B 卡在队首永远轮不到补落（复审 H 实测：B 的成因指纹在真日志文件里**出现 0 次**；
+   * 而请求级补落打印的还是当前请求的成因 ⇒ **记账与落盘不一致**）。现在 ③④ 都把「队首补落」当成
+   * 第一件事：队首那条等够了就出队落**它自己**，于是新成因最迟在下一次任何调用可见（不是永久不可见）；
+   * 没等够就原样留着（不刷新它的等待起点）。
+   *
+   * 返回值是**判决**而不是布尔：落盘行的 `errorHash` 必须用「被记账的那个成因」的值 ——
+   * 常态是本次请求的值，补落队首时是队首那条的值。返回布尔会让调用点拿当前请求的值落盘，
+   * 正好复现上面那条「记账与落盘不一致」。
+   */
+  function noteFail(
+    method: string,
+    kind: string,
+    causeHash: string,
+    causeLiteral: unknown,
+  ): FailVerdict | null {
+    const key = failKeyOf(method, kind)
+    const cause = String(causeHash)
+    const at = now()
+    const entry = failedStates.get(key)
+    if (!entry) {
+      failedStates.set(key, { reported: new Set([cause]), pending: [], lastLogAt: at })
+      return { errorHash: causeLiteral }
+    }
+    const head = entry.pending[0]
+    if (head !== undefined && head.hash === cause) {
+      if (at - entry.lastLogAt < relogFloorMs) return null
+      entry.pending.shift()
+      entry.reported.add(cause)
+      entry.lastLogAt = at
+      return { errorHash: head.errorHash }
+    }
+    if (entry.reported.has(cause) || entry.pending.some((p) => p.hash === cause)) {
+      // 本次这个成因不落盘 —— 但队首那条可能正等着补落（R2）：它本来就不是「重复」，
+      // 而是「还没落盘、在等间隔」，所以这里必须给它机会，别让它在队列里卡死。
+      if (at - entry.lastLogAt < relogFloorMs) return null
+      return flushPendingFail(entry)
+    }
+    if (at - entry.lastLogAt >= relogFloorMs) {
+      entry.reported.add(cause)
+      entry.lastLogAt = at
+      return { errorHash: causeLiteral }
+    }
+    entry.pending.push({ hash: cause, at, errorHash: causeLiteral })
+    return flushPendingFail(entry)
+  }
+  /**
+   * 队列里最老的成因等够间隔（相对它自己到达的时刻）就出队落它自己，返回它的判决。成不落盘都不会被丢掉：
+   * 没等够就留在队列里，下一次任何调用都会再试 —— 间隔内到达的成因不会因为「没人再报它」而被吞掉。
+   */
+  function flushPendingFail(entry: FailState): FailVerdict | null {
+    const head = entry.pending[0]
+    if (!head) return null
+    if (now() - head.at < relogFloorMs) return null
+    entry.pending.shift()
+    entry.reported.add(head.hash)
+    entry.lastLogAt = now()
+    return { errorHash: head.errorHash }
+  }
+  /**
+   * 这个电话成功了：清掉它的**成因账**（恢复之后再失败是**新状态**，必须重新落一条 —— 不是只报一次）。
+   * 条目本身留着：它记着上次落盘的时刻与队列（间隔的唯一依据）。
+   */
+  function clearFails(method: string): void {
+    const prefix = failKeyOf(method, '')
+    for (const [key, state] of failedStates) {
+      if (!key.startsWith(prefix)) continue
+      state.reported = new Set<string>()
+      state.pending = []
+    }
+  }
+  return {
+    fire(level: string, event: string, fields?: Record<string, unknown>): void {
+      try {
+        if (!cap) return
+        const f = (fields ?? {}) as Record<string, unknown>
+        switch (String(event ?? '')) {
+          case 'host.call': {
+            const safe = safeFields('host.call', f)
+            // 成功轨迹 = 这个电话已经恢复：清掉它的失败账（下一次失败会重新落一条）。
+            if (safe.ok === true) clearFails(String(safe.method ?? ''))
+            // 写作 `{ ...safe }` 而不是直接传 `safe`：本仓 `test:log` 的调用点扫描按「事件名后跟一个字面量
+            // 对象」认调用点（CALL_RE），少了那对大括号，这个事件会被读成「声明了却没人打」（实测变红）。
+            // 展开写法与整改前的 `{ ...f }` 同形，扫描面不变。
+            cap.log('host.call', { ...safe })
+            return
+          }
+          case 'host.call.fail': {
+            const safe = safeFields('host.call.fail', f)
+            // 成因 = 错误原文的指纹（拿原文过 hash8，而不是只看上游传的 errorHash 字段值，
+            // 因为后者可能不是 8 位十六进制、会被安全网再散一次）。
+            const causeHash = hash8(String(f.errorHash ?? ''))
+            // 落盘行的 errorHash 用**被记账的那个成因**的值（判决里给）：常态是本次请求的值，
+            // 补落队首时是队首那条的值。这里若照旧写 `{ ...safe }`，补落就会把当前请求的指纹
+            // 写进那行 —— 账记的成因与盘上的指纹对不上（R2 的「记账与落盘不一致」）。
+            const verdict = noteFail(
+              String(safe.method ?? ''), String(safe.kind ?? ''), causeHash, safe.errorHash,
+            )
+            if (verdict === null) return
+            cap.log('host.call.fail', verdict.errorHash === safe.errorHash
+              ? { ...safe }
+              : { ...safe, errorHash: verdict.errorHash })
+            return
+          }
+          case 'update.install.exec': {
+            // route 是 `cli-process` / `desktop-service`**或 `"none"`**：`"none"` 表示「没有安装配方」
+            // （包 `dist/store.js:333` 的 catch 用 `error?.exitCode ?? exitCode`，配方为空时是 undefined）
+            // —— 这条路径**没有 `exitCode` 键**，也不是一条真路由，排障时别读成一次真实执行（复审 D A3）。
+            const safe = safeFields('update.install.exec', f)
+            cap.log('update.install.exec', { ...safe })
+            return
+          }
+          default: {
+            // 更新包**目录内**的已知事件（update.status.changed / update.poll 等正常轨迹）：桥不镜像它们，
+            // 也**不再自报** —— 它们不是漂移，报出去就是 #177 的误报（warn 绕过日志开关，每进程一条）。
+            if (KNOWN_UPDATE_EVENTS.has(String(event ?? ''))) return
+            // 真目录外事件（包升版新加、清单没声明）：落盘会被闸门按「未声明事件」丢掉 —— 那就留一条
+            // 可见的自报，别让「包的日志契约变了」这件事无声通过（事件名本身不落盘，只落稳定指纹）。
+            if (unknownReported) return
+            unknownReported = true
+            cap.log('update.bridge.unknown-event', { errorHash: hash8(String(event ?? '')) })
+          }
+        }
+      } catch (e) { /* 记日志失败不许影响安装 */ }
+    },
+  }
+}
